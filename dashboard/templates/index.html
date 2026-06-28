@@ -1,0 +1,240 @@
+{% extends "base.html" %}
+
+{% block title %}Social Media Dashboard{% endblock %}
+
+{% macro bar_chart(rows, label_key='label', value_key='value') %}
+  <div class="bars">
+    {% for row in rows %}
+      <div class="bar-row">
+        <div class="bar-label">
+          <span>{{ row[label_key] }}</span>
+          <strong>{{ row[value_key]|number }}</strong>
+        </div>
+        <div class="bar-track"><div class="bar-fill" style="width: {{ row.pct }}%"></div></div>
+      </div>
+    {% else %}
+      <div class="empty-inline">No data</div>
+    {% endfor %}
+  </div>
+{% endmacro %}
+
+{% macro status_chart(rows, value_key) %}
+  {% set max_value = rows|map(attribute=value_key)|max if rows else 0 %}
+  <div class="bars">
+    {% for row in rows %}
+      {% set pct = (row[value_key] / max_value * 100) if max_value else 0 %}
+      <div class="bar-row">
+        <div class="bar-label">
+          <span>{{ row.label }}</span>
+          <strong>{{ row[value_key]|number }}</strong>
+        </div>
+        <div class="bar-track"><div class="bar-fill" style="width: {{ pct }}%"></div></div>
+      </div>
+    {% else %}
+      <div class="empty-inline">No status rows</div>
+    {% endfor %}
+  </div>
+{% endmacro %}
+
+{% block content %}
+  <section class="page-head">
+    <div>
+      <h1>Social Media Database Overview</h1>
+      <p>DuckDB dashboard for Weibo, Rednote, and Douyin crawler data.</p>
+    </div>
+  </section>
+
+  <section class="metric-grid">
+    <div class="metric">
+      <span class="metric-label">Platforms Ready</span>
+      <strong>{{ stats.totals.platforms_ready|number }}</strong>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Authors</span>
+      <strong>{{ stats.totals.authors|number }}</strong>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Posts / Videos / Notes</span>
+      <strong>{{ stats.totals.content|number }}</strong>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Comments</span>
+      <strong>{{ stats.totals.comments|number }}</strong>
+    </div>
+  </section>
+
+  <section class="platform-grid">
+    {% for row in stats.platforms %}
+      <article class="panel platform-card">
+        <div class="panel-head">
+          <h2>{{ row.label }}</h2>
+          <span class="status-pill {{ 'ok' if row.ready else 'muted' }}">{{ "ready" if row.ready else "missing" }}</span>
+        </div>
+        <div class="platform-body">
+          <dl>
+            <div><dt>Authors</dt><dd>{{ row.authors|number }}</dd></div>
+            <div><dt>Content</dt><dd>{{ row.content|number }}</dd></div>
+            <div><dt>Comments</dt><dd>{{ row.comments|number }}</dd></div>
+            <div><dt>Rows</dt><dd>{{ row.total_rows|number }}</dd></div>
+          </dl>
+          <p class="path">{{ row.db_path }}</p>
+        </div>
+      </article>
+    {% endfor %}
+  </section>
+
+  <section class="three-col">
+    <div class="panel">
+      <div class="panel-head"><h2>Records By Platform</h2></div>
+      {{ bar_chart(stats.charts.platform_records) }}
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2>Content By Platform</h2></div>
+      {{ bar_chart(stats.charts.content_mix) }}
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2>Comments By Platform</h2></div>
+      {{ bar_chart(stats.charts.comment_mix) }}
+    </div>
+  </section>
+
+  <section class="two-col">
+    <div class="panel">
+      <div class="panel-head"><h2>Collections</h2></div>
+      <table>
+        <thead>
+          <tr>
+            <th>Platform</th>
+            <th>Collection</th>
+            <th class="num">Rows</th>
+            <th>Last Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in stats.collections %}
+            <tr>
+              <td>{{ row.platform_label }}</td>
+              <td><a href="{{ url_for('browse_collection', platform=row.platform, collection=row.collection) }}">{{ row.label }}</a></td>
+              <td class="num">{{ row.rows|number }}</td>
+              <td>{{ row.last_updated_at or "-" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2>Tasks By Type</h2></div>
+      {{ bar_chart(stats.charts.task_types) }}
+      <table class="compact-table">
+        <thead><tr><th>Platform</th><th>Type</th><th class="num">Tasks</th></tr></thead>
+        <tbody>
+          {% for row in stats.tasks %}
+            <tr>
+              <td>{{ platforms.get(row.platform).label if platforms.get(row.platform) else row.platform }}</td>
+              <td>{{ row.scrape_type }}</td>
+              <td class="num">{{ row.tasks|number }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="3">No task records yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  {% for platform_key, detail in stats.platform_details.items() %}
+    {% set platform_config = platforms[platform_key] %}
+    <section class="platform-section">
+      <div class="section-head">
+        <h2>{{ platform_config.label }} Details</h2>
+      </div>
+      <div class="two-col">
+        <div class="panel">
+          <div class="panel-head"><h2>Status</h2></div>
+          {{ status_chart(detail.status, 'posts' if platform_key != 'douyin' else 'videos') }}
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Top Authors</h2></div>
+          <table>
+            <thead><tr><th>Author ID</th><th class="num">Records</th></tr></thead>
+            <tbody>
+              {% for row in detail.top_authors %}
+                <tr>
+                  <td>{{ row.author_id }}</td>
+                  <td class="num">{{ row.records|number }}</td>
+                </tr>
+              {% else %}
+                <tr><td colspan="2">No author breakdown yet.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {% if detail.top_keywords %}
+        <div class="panel">
+          <div class="panel-head"><h2>Top Keywords</h2></div>
+          <table>
+            <thead><tr><th>Keyword</th><th class="num">Records</th></tr></thead>
+            <tbody>
+              {% for row in detail.top_keywords %}
+                <tr>
+                  <td>{{ row.keyword }}</td>
+                  <td class="num">{{ row.records|number }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% endif %}
+
+      <div class="two-col">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>{{ "Top Notes" if platform_key == "rednote" else ("Top Videos" if platform_key == "douyin" else "Most Commented Posts") }}</h2>
+          </div>
+          <table>
+            <thead><tr><th>Content</th><th class="num">{{ "Likes" if platform_key == "rednote" else ("Plays" if platform_key == "douyin" else "Comments") }}</th></tr></thead>
+            <tbody>
+              {% for row in detail.top_content %}
+                <tr>
+                  <td>{{ row.title or row.content_id }}</td>
+                  <td class="num">{{ row.value|number }}</td>
+                </tr>
+              {% else %}
+                <tr><td colspan="2">No content ranking yet.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Numeric Stats</h2></div>
+          <table>
+            <thead>
+              <tr>
+                <th>Metric</th>
+                <th class="num">N</th>
+                <th class="num">Average</th>
+                <th class="num">Median</th>
+                <th class="num">Max</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in detail.numeric %}
+                <tr>
+                  <td>{{ row.metric }}</td>
+                  <td class="num">{{ row.n|number }}</td>
+                  <td class="num">{{ row.avg|decimal }}</td>
+                  <td class="num">{{ row.median|decimal }}</td>
+                  <td class="num">{{ row.max|number }}</td>
+                </tr>
+              {% else %}
+                <tr><td colspan="5">No numeric stats yet.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  {% endfor %}
+{% endblock %}
