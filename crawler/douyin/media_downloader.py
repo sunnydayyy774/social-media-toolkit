@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from loguru import logger
@@ -112,9 +112,9 @@ class DouyinMediaDownloader:
             if candidate.id in seen:
                 continue
             seen.add(candidate.id)
-            result.discovered += 1
-            if self.limit is not None and result.discovered > self.limit:
+            if self.limit is not None and result.discovered >= self.limit:
                 break
+            result.discovered += 1
             status = self.process_candidate(candidate)
             if status == "DOWNLOADED":
                 result.downloaded += 1
@@ -176,24 +176,31 @@ class DouyinMediaDownloader:
             if not aweme_id or not comment_id:
                 continue
             task_id = value_to_str(record.get("task_id"))
+            data = record.get("data")
             if "comment-image" in self.media_types:
-                for url in csv_urls(record.get("image_urls_csv")):
-                    yield MediaCandidate("comment-image", url, aweme_id=aweme_id, comment_id=comment_id, task_id=task_id)
-                data = record.get("data")
                 if isinstance(data, dict):
-                    for url in collect_urls_under_keys(data.get("raw_comment_json"), IMAGE_KEYS):
+                    image_urls = preferred_urls_from_media_list(data.get("image_list"))
+                    if not image_urls:
+                        image_urls = preferred_urls_from_raw_key(data.get("raw_comment_json"), "image_list")
+                    if not image_urls:
+                        image_urls = first_url_group(csv_urls(record.get("image_urls_csv")))
+                    for url in image_urls:
                         yield MediaCandidate("comment-image", url, aweme_id=aweme_id, comment_id=comment_id, task_id=task_id)
             if "comment-sticker" in self.media_types:
-                data = record.get("data")
                 if isinstance(data, dict):
-                    for url in csv_urls(record.get("video_urls_csv")):
-                        yield MediaCandidate("comment-sticker", url, aweme_id=aweme_id, comment_id=comment_id, task_id=task_id)
-                    for url in collect_urls_under_keys(data.get("raw_comment_json"), COMMENT_STICKER_KEYS):
+                    sticker_urls = preferred_urls_from_raw_keys(data.get("raw_comment_json"), COMMENT_STICKER_KEYS)
+                    if not sticker_urls:
+                        sticker_urls = preferred_urls_from_media_list(data.get("video_list"))
+                    if not sticker_urls:
+                        sticker_urls = first_url_group(csv_urls(record.get("video_urls_csv")))
+                    for url in sticker_urls:
                         yield MediaCandidate("comment-sticker", url, aweme_id=aweme_id, comment_id=comment_id, task_id=task_id)
             if "comment-video" in self.media_types:
-                data = record.get("data")
                 if isinstance(data, dict):
-                    for url in collect_urls_under_keys(data.get("raw_comment_json"), COMMENT_VIDEO_KEYS):
+                    comment_video_urls = preferred_urls_from_raw_keys(data.get("raw_comment_json"), COMMENT_VIDEO_KEYS)
+                    if not comment_video_urls:
+                        comment_video_urls = preferred_urls_from_media_list(data.get("video_list"))
+                    for url in comment_video_urls:
                         yield MediaCandidate("comment-video", url, aweme_id=aweme_id, comment_id=comment_id, task_id=task_id)
 
     def iter_danmaku_candidates(self) -> Iterator[MediaCandidate]:
@@ -205,7 +212,7 @@ class DouyinMediaDownloader:
             data = record.get("data")
             if not aweme_id or not danmaku_id or not isinstance(data, dict):
                 continue
-            for url in collect_urls_under_keys(data, DANMAKU_STICKER_KEYS):
+            for url in preferred_urls_from_raw_keys(data, DANMAKU_STICKER_KEYS):
                 yield MediaCandidate(
                     "danmaku-sticker",
                     url,
@@ -433,10 +440,104 @@ def collect_urls_under_keys(value: Any, key_names: set[str]) -> list[str]:
     return dedupe_urls(urls)
 
 
+def preferred_urls_from_media_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    urls: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        url = preferred_url_for_media_item(item)
+        if url:
+            urls.append(url)
+    return dedupe_urls(urls)
+
+
+def preferred_urls_from_raw_key(value: Any, key_name: str) -> list[str]:
+    urls: list[str] = []
+    for item in iter_values_for_key(value, key_name):
+        if isinstance(item, list):
+            for child in item:
+                if isinstance(child, dict):
+                    url = preferred_url_for_media_item(child)
+                    if url:
+                        urls.append(url)
+                elif isinstance(child, str) and is_http_url(child):
+                    urls.append(child)
+        elif isinstance(item, dict):
+            url = preferred_url_for_media_item(item)
+            if url:
+                urls.append(url)
+        elif isinstance(item, str) and is_http_url(item):
+            urls.append(item)
+    return dedupe_urls(urls)
+
+
+def preferred_urls_from_raw_keys(value: Any, key_names: set[str]) -> list[str]:
+    urls: list[str] = []
+    for key_name in key_names:
+        urls.extend(preferred_urls_from_raw_key(value, key_name))
+    return dedupe_urls(urls)
+
+
+def preferred_url_for_media_item(item: dict[str, Any]) -> str | None:
+    candidates = collect_url_values(item)
+    if not candidates:
+        return None
+    return sorted(candidates, key=url_preference_score)[0]
+
+
+def first_url_group(urls: list[str]) -> list[str]:
+    return urls[:1]
+
+
+def iter_values_for_key(value: Any, key_name: str) -> Iterator[Any]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == key_name:
+                yield child
+            if isinstance(child, dict | list):
+                yield from iter_values_for_key(child, key_name)
+    elif isinstance(value, list):
+        for child in value:
+            yield from iter_values_for_key(child, key_name)
+
+
+def url_preference_score(url: str) -> tuple[int, int, int, str]:
+    parsed = urlparse(url)
+    text = url.lower()
+    query = parse_qs(parsed.query)
+    path = parsed.path.lower()
+    score = 0
+    if "thumb" in text or query.get("sc") == ["thumb"]:
+        score += 40
+    if "watermark" in text or query.get("sc") == ["watermark"]:
+        score += 30
+    if ".heic" in path:
+        score += 20
+    if ".jpeg" in path or ".jpg" in path:
+        score += 5
+    if ".webp" in path or ".image" in path:
+        score -= 5
+    if "origin" in text or query.get("sc") == ["image"]:
+        score -= 10
+    return (score, len(url), stable_host_rank(parsed.netloc), url)
+
+
+def stable_host_rank(host: str) -> int:
+    if host.startswith("p3-"):
+        return 0
+    if host.startswith("p11-"):
+        return 1
+    if host.startswith("p26-"):
+        return 2
+    return 3
+
+
 def collect_url_values(value: Any) -> list[str]:
     urls: list[str] = []
     if isinstance(value, str):
-        if value.startswith("http://") or value.startswith("https://"):
+        if is_http_url(value):
             urls.append(value)
     elif isinstance(value, dict):
         for key, child in value.items():
@@ -450,6 +551,10 @@ def collect_url_values(value: Any) -> list[str]:
         for child in value:
             urls.extend(collect_url_values(child))
     return dedupe_urls(urls)
+
+
+def is_http_url(value: str) -> bool:
+    return value.startswith("http://") or value.startswith("https://")
 
 
 def csv_urls(value: Any) -> list[str]:
