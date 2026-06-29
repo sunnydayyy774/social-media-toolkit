@@ -11,6 +11,7 @@ from typing import Annotated
 import typer
 
 from crawler.douyin import DouyinCrawler, DouyinCrawlerConfig
+from crawler.douyin.media_downloader import DEFAULT_MEDIA_TYPES, DouyinMediaDownloader
 from crawler.rednote import RednoteCrawler, RednoteCrawlerConfig
 from crawler.weibo import WeiboCrawler, WeiboCrawlerConfig
 from dashboard import create_app
@@ -845,6 +846,95 @@ def douyin_keyword(
             )
 
     run_async(run())
+
+
+@douyin_app.command("download-media")
+def douyin_download_media(
+    ctx: typer.Context,
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output-dir", help="Directory where downloaded Douyin media files are saved."),
+    ] = Path("data/douyin-media"),
+    media_type: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--type",
+            help=(
+                "Media type to download. Repeat for multiple types. "
+                "Allowed: video, cover, comment-image, comment-sticker, comment-video, danmaku-sticker."
+            ),
+        ),
+    ] = None,
+    only_aweme_id: Annotated[
+        list[str] | None,
+        typer.Option("--only-aweme-id", help="Only download media for these Douyin aweme IDs. Repeat for multiple videos."),
+    ] = None,
+    from_task_id: Annotated[
+        str | None,
+        typer.Option("--from-task-id", help="Only download media from records with this task id."),
+    ] = None,
+    limit: Annotated[
+        int | None,
+        typer.Option(help="Maximum number of unique media assets to process."),
+    ] = None,
+    retry_failed: Annotated[
+        bool,
+        typer.Option("--retry-failed", help="Retry assets previously marked as FAILED."),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Overwrite existing local files."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Preview media URLs and target paths without writing files or database records."),
+    ] = False,
+    refresh_video_urls: Annotated[
+        bool,
+        typer.Option(
+            "--refresh-video-urls/--no-refresh-video-urls",
+            help="When a video URL returns 403, refresh aweme_detail in the logged-in browser and retry once.",
+        ),
+    ] = True,
+) -> None:
+    """Download Douyin videos, comment media, and sticker assets from local DuckDB records."""
+    state = cli_state(ctx)
+    selected_types = set(media_type or DEFAULT_MEDIA_TYPES)
+    unknown_types = selected_types - DEFAULT_MEDIA_TYPES
+    if unknown_types:
+        raise typer.BadParameter(
+            f"Unknown media type(s): {', '.join(sorted(unknown_types))}. "
+            f"Allowed: {', '.join(sorted(DEFAULT_MEDIA_TYPES))}",
+            param_hint="--type",
+        )
+
+    downloader = DouyinMediaDownloader(
+        platform_db_path(state, "douyin"),
+        output_dir=output_dir,
+        media_types=selected_types,
+        only_aweme_ids=only_aweme_id,
+        from_task_id=from_task_id,
+        limit=limit,
+        retry_failed=retry_failed,
+        overwrite=overwrite,
+        dry_run=dry_run,
+        refresh_video_urls=refresh_video_urls,
+        headless=state.headless,
+        user_data_dir=state.user_data_dir or Path("data/douyin-browser-profile"),
+    )
+    try:
+        result = downloader.run()
+    finally:
+        downloader.close()
+
+    typer.echo(
+        "Douyin media download complete: "
+        f"discovered={result.discovered}, "
+        f"downloaded={result.downloaded}, "
+        f"skipped={result.skipped}, "
+        f"failed={result.failed}, "
+        f"output_dir={output_dir}"
+    )
 
 
 @douyin_app.command("author-info")

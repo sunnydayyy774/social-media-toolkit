@@ -14,6 +14,7 @@ AUTHOR_COLLECTION = "douyin_authors"
 VIDEO_RAW_COLLECTION = "douyin_videos_raw"
 COMMENT_RAW_COLLECTION = "douyin_comments_raw"
 DANMAKU_RAW_COLLECTION = "douyin_danmaku_raw"
+MEDIA_ASSET_COLLECTION = "douyin_media_assets"
 
 COMMENTS_FAILED_PANEL = "COMMENTS_FAILED_PANEL"
 COMMENTS_PARTIAL = "COMMENTS_PARTIAL"
@@ -158,6 +159,51 @@ class DouyinStore:
             merged.update(record)
             self.db.replace(DANMAKU_RAW_COLLECTION, danmaku_id, merged)
         return True
+
+    def save_media_asset(
+        self,
+        asset_id: str,
+        *,
+        asset_type: str,
+        source_url: str,
+        aweme_id: str | None = None,
+        comment_id: str | None = None,
+        danmaku_id: str | None = None,
+        local_path: str | None = None,
+        download_status: str = "PENDING",
+        file_size: int | None = None,
+        content_type: str | None = None,
+        error: str | None = None,
+        task_id: str | None = None,
+    ) -> Record:
+        record: Record = {
+            "id": asset_id,
+            "asset_id": asset_id,
+            "asset_type": asset_type,
+            "source_url": source_url,
+            "url": source_url,
+            "download_status": download_status,
+            "status": download_status,
+            "updated_at": now_iso(),
+        }
+        optional = {
+            "aweme_id": aweme_id,
+            "comment_id": comment_id,
+            "danmaku_id": danmaku_id,
+            "local_path": local_path,
+            "file_size": file_size,
+            "content_type": content_type,
+            "error": error,
+            "task_id": task_id,
+        }
+        record.update({key: value for key, value in optional.items() if value is not None})
+
+        existing = self.db.read(MEDIA_ASSET_COLLECTION, asset_id)
+        if existing is None:
+            return self.db.create(MEDIA_ASSET_COLLECTION, record, asset_id)
+        merged = existing.copy()
+        merged.update(record)
+        return self.db.replace(MEDIA_ASSET_COLLECTION, asset_id, merged)
 
     def save_comment_raw(
         self,
@@ -371,6 +417,9 @@ class DouyinStore:
 
     def list_danmaku(self) -> list[Record]:
         return self.db.list(DANMAKU_RAW_COLLECTION)
+
+    def list_media_assets(self) -> list[Record]:
+        return self.db.list(MEDIA_ASSET_COLLECTION)
 
 
 def now_iso() -> str:

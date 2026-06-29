@@ -270,6 +270,36 @@ For `douyin keyword`, pass the human-readable search term, not a URL-encoded str
 
 Douyin danmaku is saved separately in `douyin_danmaku`. The crawler requests danmaku by video time windows, using the logged-in browser session and each video's `authentication_token`. Videos without danmaku enabled or without the required web token are marked as unavailable for danmaku instead of being mixed into the comments table.
 
+Download saved Douyin media after crawling:
+
+```bash
+uv run main.py douyin download-media
+```
+
+Preview what would be downloaded without writing files or database records:
+
+```bash
+uv run main.py douyin download-media --dry-run --limit 20
+```
+
+Download only selected media types:
+
+```bash
+uv run main.py douyin download-media \
+  --type video \
+  --type comment-image \
+  --type comment-sticker \
+  --type danmaku-sticker
+```
+
+Downloaded files are saved under:
+
+```text
+data/douyin-media/
+```
+
+The download index is saved in `douyin_media_assets`. This command reads existing DuckDB records only; it does not recrawl comments or modify the dashboard.
+
 Fetch author profile info:
 
 ```bash

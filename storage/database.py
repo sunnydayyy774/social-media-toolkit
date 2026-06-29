@@ -35,6 +35,7 @@ _COLLECTION_TABLES = {
     "douyin_comments_raw": "douyin_comments",
     "douyin_danmaku": "douyin_danmaku",
     "douyin_danmaku_raw": "douyin_danmaku",
+    "douyin_media_assets": "douyin_media_assets",
 }
 
 _PLATFORM_TABLES = sorted(set(_COLLECTION_TABLES.values()))
@@ -472,7 +473,8 @@ class DuckDBDatabase:
             WHERE collection IN (
                 'weibo_authors', 'weibo_posts_raw', 'weibo_comments',
                 'rednote_authors', 'rednote_posts_raw', 'rednote_post_metadata', 'rednote_comments',
-                'douyin_authors', 'douyin_videos_raw', 'douyin_comments_raw', 'douyin_danmaku_raw'
+                'douyin_authors', 'douyin_videos_raw', 'douyin_comments_raw',
+                'douyin_danmaku_raw', 'douyin_media_assets'
             )
             """
         ).fetchall()
