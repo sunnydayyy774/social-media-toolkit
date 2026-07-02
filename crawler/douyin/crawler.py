@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -45,6 +47,9 @@ class DouyinCrawlerConfig(BrowserCrawlerConfig):
     search_channel: str = "aweme_video_web"
     search_api_path: str = DOUYIN_SEARCH_API_PATH
     danmaku_api_path: str = DOUYIN_DANMAKU_API_PATH
+    download_comment_media: bool = False
+    comment_media_output_dir: str | Path = "data/douyin-media"
+    overwrite_comment_media: bool = False
 
 
 class DouyinCrawler(BrowserCrawler[DouyinCrawlerConfig, DouyinStore]):
@@ -511,13 +516,14 @@ class DouyinCrawler(BrowserCrawler[DouyinCrawlerConfig, DouyinStore]):
             for comment in comments:
                 if not isinstance(comment, dict):
                     continue
-                if self.store.save_comment(aweme_id, comment, task_id=task_id):
+                if await self._save_comment_and_download_media(page, aweme_id, comment, task_id=task_id):
                     total_saved += 1
                 parent_cid = value_to_str(comment.get("cid"))
                 replies = comment.get("reply_comment")
                 if isinstance(replies, list):
                     for reply in replies:
-                        if isinstance(reply, dict) and self.store.save_comment(
+                        if isinstance(reply, dict) and await self._save_comment_and_download_media(
+                            page,
                             aweme_id,
                             reply,
                             parent_cid,
@@ -609,7 +615,8 @@ class DouyinCrawler(BrowserCrawler[DouyinCrawlerConfig, DouyinStore]):
                 return saved
             page_number += 1
             for comment in comments:
-                if isinstance(comment, dict) and self.store.save_comment(
+                if isinstance(comment, dict) and await self._save_comment_and_download_media(
+                    page,
                     aweme_id,
                     comment,
                     comment_id,
@@ -643,6 +650,163 @@ class DouyinCrawler(BrowserCrawler[DouyinCrawlerConfig, DouyinStore]):
         url = f"{DOUYIN_BASE_URL}/aweme/v1/web/comment/list/reply/?{urlencode(params)}"
         response = await browser_fetch_json(page, url)
         return response if isinstance(response, dict) else {}
+
+    async def _save_comment_and_download_media(
+        self,
+        page: Any,
+        aweme_id: str,
+        comment: dict[str, Any],
+        parent_comment_id: str | None = None,
+        *,
+        task_id: str | None,
+    ) -> bool:
+        saved = self.store.save_comment(
+            aweme_id,
+            comment,
+            parent_comment_id,
+            task_id=task_id,
+        )
+        if saved and self.config.download_comment_media:
+            await self._download_comment_media(page, aweme_id, comment, task_id=task_id)
+        return saved
+
+    async def _download_comment_media(
+        self,
+        page: Any,
+        aweme_id: str,
+        comment: dict[str, Any],
+        *,
+        task_id: str | None,
+    ) -> None:
+        from .media_downloader import (
+            COMMENT_STICKER_KEYS,
+            path_with_content_type,
+            preferred_urls_from_media_list,
+            preferred_urls_from_raw_key,
+            preferred_urls_from_raw_keys,
+            safe_part,
+            extension_from_url,
+        )
+
+        comment_id = value_to_str(comment.get("cid"))
+        if not comment_id:
+            return
+
+        image_urls = preferred_urls_from_media_list(comment.get("image_list"))
+        if not image_urls:
+            image_urls = preferred_urls_from_raw_key(comment, "image_list")
+
+        sticker_urls = preferred_urls_from_raw_keys(comment, COMMENT_STICKER_KEYS)
+        output_root = Path(self.config.comment_media_output_dir)
+
+        for index, url in enumerate(image_urls, start=1):
+            await self._download_comment_media_url(
+                page,
+                asset_type="comment-image",
+                source_url=url,
+                aweme_id=aweme_id,
+                comment_id=comment_id,
+                index=index,
+                output_root=output_root,
+                extension_from_url=extension_from_url,
+                path_with_content_type=path_with_content_type,
+                safe_part=safe_part,
+                task_id=task_id,
+            )
+
+        for index, url in enumerate(sticker_urls, start=1):
+            await self._download_comment_media_url(
+                page,
+                asset_type="comment-sticker",
+                source_url=url,
+                aweme_id=aweme_id,
+                comment_id=comment_id,
+                index=index,
+                output_root=output_root,
+                extension_from_url=extension_from_url,
+                path_with_content_type=path_with_content_type,
+                safe_part=safe_part,
+                task_id=task_id,
+            )
+
+    async def _download_comment_media_url(
+        self,
+        page: Any,
+        *,
+        asset_type: str,
+        source_url: str,
+        aweme_id: str,
+        comment_id: str,
+        index: int,
+        output_root: Path,
+        extension_from_url: Any,
+        path_with_content_type: Any,
+        safe_part: Any,
+        task_id: str | None,
+    ) -> None:
+        asset_id = stable_comment_media_asset_id(asset_type, aweme_id, comment_id, index)
+        existing = self.store.db.read("douyin_media_assets", asset_id)
+        if existing is not None and existing.get("download_status") == "DONE" and not self.config.overwrite_comment_media:
+            local_path = existing.get("local_path")
+            if local_path and Path(str(local_path)).exists() and Path(str(local_path)).stat().st_size > 0:
+                return
+
+        source_digest = hashlib.sha1(source_url.encode("utf-8")).hexdigest()[:12]
+        ext = extension_from_url(source_url.split("?", 1)[0])
+        folder = output_root / "comments" / safe_part(aweme_id) / safe_part(comment_id)
+        local_path = folder / f"{asset_type}-{index}-{source_digest}{ext}"
+
+        self.store.save_media_asset(
+            asset_id,
+            asset_type=asset_type,
+            source_url=source_url,
+            aweme_id=aweme_id,
+            comment_id=comment_id,
+            local_path=str(local_path),
+            download_status="PENDING",
+            task_id=task_id,
+        )
+
+        try:
+            headers = {
+                "Accept": "*/*",
+                "Referer": "https://www.douyin.com/",
+            }
+            response = await page.context.request.get(source_url, headers=headers, timeout=30000)
+            if not response.ok:
+                raise RuntimeError(f"HTTP {response.status}")
+            content_type = response.headers.get("content-type")
+            body = await response.body()
+            target = path_with_content_type(local_path, content_type)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists() or target.stat().st_size == 0 or self.config.overwrite_comment_media:
+                target.write_bytes(body)
+            self.store.save_media_asset(
+                asset_id,
+                asset_type=asset_type,
+                source_url=source_url,
+                aweme_id=aweme_id,
+                comment_id=comment_id,
+                local_path=str(target),
+                download_status="DONE",
+                file_size=target.stat().st_size if target.exists() else None,
+                content_type=content_type,
+                task_id=task_id,
+            )
+            logger.info("Downloaded Douyin {} during crawl -> {}", asset_type, target)
+        except Exception as exc:
+            self.store.save_media_asset(
+                asset_id,
+                asset_type=asset_type,
+                source_url=source_url,
+                aweme_id=aweme_id,
+                comment_id=comment_id,
+                local_path=str(local_path),
+                download_status="FAILED",
+                error=str(exc)[:1000],
+                task_id=task_id,
+            )
+            logger.warning("Failed downloading Douyin {} during crawl: {}", asset_type, exc)
 
     async def _collect_danmaku_for_videos(
         self,
@@ -861,6 +1025,13 @@ def filter_aweme_ids(
     if skip_set:
         filtered = [aweme_id for aweme_id in filtered if aweme_id not in skip_set]
     return filtered
+
+
+def stable_comment_media_asset_id(asset_type: str, aweme_id: str, comment_id: str, index: int) -> str:
+    digest = hashlib.sha1(
+        "|".join([asset_type, aweme_id, comment_id, str(index)]).encode("utf-8")
+    ).hexdigest()
+    return f"{asset_type}:{digest}"
 
 
 def base_params(**overrides: Any) -> dict[str, Any]:

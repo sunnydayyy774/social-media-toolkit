@@ -251,6 +251,9 @@ def douyin_config(
     danmaku_only: bool = False,
     danmaku_window_ms: int = 32000,
     request_count: int = 20,
+    download_comment_media: bool = False,
+    comment_media_output_dir: Path = Path("data/douyin-media"),
+    overwrite_comment_media: bool = False,
 ) -> DouyinCrawlerConfig:
     return DouyinCrawlerConfig(
         db_path=platform_db_path(state, "douyin"),
@@ -267,6 +270,9 @@ def douyin_config(
         danmaku_only=danmaku_only,
         danmaku_window_ms=danmaku_window_ms,
         request_count=request_count,
+        download_comment_media=download_comment_media,
+        comment_media_output_dir=comment_media_output_dir,
+        overwrite_comment_media=overwrite_comment_media,
     )
 
 
@@ -671,6 +677,18 @@ def douyin_author(
         int,
         typer.Option(help="Stop after this many empty Douyin video pages."),
     ] = 5,
+    download_comment_media: Annotated[
+        bool,
+        typer.Option("--download-comment-media", help="Download Douyin comment images and custom stickers while crawling comments."),
+    ] = False,
+    comment_media_output_dir: Annotated[
+        Path,
+        typer.Option("--comment-media-output-dir", help="Directory where crawl-time Douyin comment media files are saved."),
+    ] = Path("data/douyin-media"),
+    overwrite_comment_media: Annotated[
+        bool,
+        typer.Option("--overwrite-comment-media", help="Overwrite existing crawl-time comment media files."),
+    ] = False,
     from_local: Annotated[
         bool,
         typer.Option("--from-local", help="Skip discovery and process pending video IDs from the local database."),
@@ -716,6 +734,9 @@ def douyin_author(
                 collect_danmaku=collect_danmaku,
                 danmaku_only=danmaku_only,
                 danmaku_window_ms=danmaku_window_ms,
+                download_comment_media=download_comment_media,
+                comment_media_output_dir=comment_media_output_dir,
+                overwrite_comment_media=overwrite_comment_media,
             )
         ) as crawler:
             await crawler.by_author(
@@ -777,6 +798,18 @@ def douyin_keyword(
         int,
         typer.Option(help="Stop after this many empty Douyin keyword pages."),
     ] = 5,
+    download_comment_media: Annotated[
+        bool,
+        typer.Option("--download-comment-media", help="Download Douyin comment images and custom stickers while crawling comments."),
+    ] = False,
+    comment_media_output_dir: Annotated[
+        Path,
+        typer.Option("--comment-media-output-dir", help="Directory where crawl-time Douyin comment media files are saved."),
+    ] = Path("data/douyin-media"),
+    overwrite_comment_media: Annotated[
+        bool,
+        typer.Option("--overwrite-comment-media", help="Overwrite existing crawl-time comment media files."),
+    ] = False,
     from_local: Annotated[
         bool,
         typer.Option("--from-local", help="Skip discovery and process pending keyword video IDs from the local database."),
@@ -814,6 +847,9 @@ def douyin_keyword(
             "danmaku_only": danmaku_only,
             "max_danmaku_windows": max_danmaku_windows,
             "danmaku_window_ms": danmaku_window_ms,
+            "download_comment_media": download_comment_media,
+            "comment_media_output_dir": str(comment_media_output_dir),
+            "overwrite_comment_media": overwrite_comment_media,
         },
     )
 
@@ -831,6 +867,9 @@ def douyin_keyword(
                 danmaku_only=danmaku_only,
                 danmaku_window_ms=danmaku_window_ms,
                 request_count=page_size,
+                download_comment_media=download_comment_media,
+                comment_media_output_dir=comment_media_output_dir,
+                overwrite_comment_media=overwrite_comment_media,
             )
         ) as crawler:
             await crawler.by_keyword(
@@ -861,7 +900,8 @@ def douyin_download_media(
             "--type",
             help=(
                 "Media type to download. Repeat for multiple types. "
-                "Allowed: video, cover, comment-image, comment-sticker, comment-video, danmaku-sticker."
+                "Allowed: video, cover, comment-video, danmaku-sticker. "
+                "Comment images and custom stickers are only downloaded during comment crawling with --download-comment-media."
             ),
         ),
     ] = None,
@@ -897,7 +937,7 @@ def douyin_download_media(
         ),
     ] = True,
 ) -> None:
-    """Download Douyin videos, comment media, and sticker assets from local DuckDB records."""
+    """Download Douyin videos and non-comment-image media from local DuckDB records."""
     state = cli_state(ctx)
     selected_types = set(media_type or DEFAULT_MEDIA_TYPES)
     unknown_types = selected_types - DEFAULT_MEDIA_TYPES

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import mimetypes
 from collections.abc import Iterable, Iterator
@@ -16,14 +17,12 @@ from loguru import logger
 from storage import DuckDBDatabase, Record
 from .crawler import DouyinCrawler, DouyinCrawlerConfig, search_aweme_sec_user_id
 from .storage import DouyinStore
-from .utils import video_url, value_to_str
+from .utils import DOUYIN_BASE_URL, video_url, value_to_str
 
 
 DEFAULT_MEDIA_TYPES = {
     "video",
     "cover",
-    "comment-image",
-    "comment-sticker",
     "comment-video",
     "danmaku-sticker",
 }
@@ -127,7 +126,7 @@ class DouyinMediaDownloader:
     def iter_candidates(self) -> Iterator[MediaCandidate]:
         if "video" in self.media_types or "cover" in self.media_types:
             yield from self.iter_video_candidates()
-        if any(item in self.media_types for item in {"comment-image", "comment-sticker", "comment-video"}):
+        if "comment-video" in self.media_types:
             yield from self.iter_comment_candidates()
         if "danmaku-sticker" in self.media_types:
             yield from self.iter_danmaku_candidates()
@@ -177,24 +176,6 @@ class DouyinMediaDownloader:
                 continue
             task_id = value_to_str(record.get("task_id"))
             data = record.get("data")
-            if "comment-image" in self.media_types:
-                if isinstance(data, dict):
-                    image_urls = preferred_urls_from_media_list(data.get("image_list"))
-                    if not image_urls:
-                        image_urls = preferred_urls_from_raw_key(data.get("raw_comment_json"), "image_list")
-                    if not image_urls:
-                        image_urls = first_url_group(csv_urls(record.get("image_urls_csv")))
-                    for url in image_urls:
-                        yield MediaCandidate("comment-image", url, aweme_id=aweme_id, comment_id=comment_id, task_id=task_id)
-            if "comment-sticker" in self.media_types:
-                if isinstance(data, dict):
-                    sticker_urls = preferred_urls_from_raw_keys(data.get("raw_comment_json"), COMMENT_STICKER_KEYS)
-                    if not sticker_urls:
-                        sticker_urls = preferred_urls_from_media_list(data.get("video_list"))
-                    if not sticker_urls:
-                        sticker_urls = first_url_group(csv_urls(record.get("video_urls_csv")))
-                    for url in sticker_urls:
-                        yield MediaCandidate("comment-sticker", url, aweme_id=aweme_id, comment_id=comment_id, task_id=task_id)
             if "comment-video" in self.media_types:
                 if isinstance(data, dict):
                     comment_video_urls = preferred_urls_from_raw_keys(data.get("raw_comment_json"), COMMENT_VIDEO_KEYS)
@@ -235,7 +216,11 @@ class DouyinMediaDownloader:
         if existing is not None and existing.get("download_status") == "DONE" and not self.overwrite:
             if not self.retry_failed:
                 return "SKIPPED"
-            if existing.get("local_path") and Path(str(existing["local_path"])).exists():
+            if (
+                existing.get("local_path")
+                and Path(str(existing["local_path"])).exists()
+                and Path(str(existing["local_path"])).stat().st_size > 0
+            ):
                 return "SKIPPED"
         if existing is not None and existing.get("download_status") == "FAILED" and not self.retry_failed:
             return "SKIPPED"
@@ -280,6 +265,27 @@ class DouyinMediaDownloader:
                 if refreshed is not None and refreshed.source_url != candidate.source_url:
                     logger.info("Retrying Douyin video download with refreshed URL for {}", candidate.aweme_id)
                     return self.process_candidate(refreshed)
+            if candidate.asset_type in {"comment-image", "comment-sticker", "comment-video", "danmaku-sticker"} and exc.code == 403:
+                try:
+                    path, content_type = self.download_with_browser(candidate.source_url, local_path)
+                    file_size = path.stat().st_size if path.exists() else None
+                    self.store.save_media_asset(
+                        candidate.id,
+                        asset_type=candidate.asset_type,
+                        source_url=candidate.source_url,
+                        aweme_id=candidate.aweme_id,
+                        comment_id=candidate.comment_id,
+                        danmaku_id=candidate.danmaku_id,
+                        local_path=str(path),
+                        download_status="DONE",
+                        file_size=file_size,
+                        content_type=content_type,
+                        task_id=candidate.task_id,
+                    )
+                    logger.info("Downloaded {} with browser -> {}", candidate.asset_type, path)
+                    return "DOWNLOADED"
+                except Exception as browser_exc:
+                    logger.warning("Browser download also failed for {}: {}", candidate.source_url, browser_exc)
             self.save_failed_candidate(candidate, local_path, exc)
             return "FAILED"
         except Exception as exc:
@@ -395,7 +401,7 @@ class DouyinMediaDownloader:
         with urlopen(request, timeout=self.timeout_seconds) as response:
             content_type = response.headers.get("Content-Type")
             target = path_with_content_type(path, content_type)
-            if target.exists() and not self.overwrite:
+            if target.exists() and target.stat().st_size > 0 and not self.overwrite:
                 return target, content_type
             with target.open("wb") as file:
                 while True:
@@ -404,6 +410,62 @@ class DouyinMediaDownloader:
                         break
                     file.write(chunk)
             return target, content_type
+
+    def download_with_browser(self, url: str, path: Path) -> tuple[Path, str | None]:
+        return asyncio.run(self.download_with_browser_async(url, path))
+
+    async def download_with_browser_async(self, url: str, path: Path) -> tuple[Path, str | None]:
+        async with DouyinCrawler(
+            DouyinCrawlerConfig(
+                db_path=self.db.path,
+                headless=self.headless,
+                user_data_dir=self.user_data_dir,
+            )
+        ) as crawler:
+            page = await crawler.new_page()
+            await page.goto(DOUYIN_BASE_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(1500)
+            result = await page.evaluate(
+                """
+                async (url) => {
+                    const response = await fetch(url, {
+                        method: 'GET',
+                        credentials: 'include',
+                        headers: {
+                            'accept': '*/*',
+                            'referer': 'https://www.douyin.com/'
+                        }
+                    });
+                    const buffer = await response.arrayBuffer();
+                    const bytes = new Uint8Array(buffer);
+                    let binary = '';
+                    const chunkSize = 0x8000;
+                    for (let index = 0; index < bytes.length; index += chunkSize) {
+                        binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+                    }
+                    return {
+                        ok: response.ok,
+                        status: response.status,
+                        contentType: response.headers.get('content-type'),
+                        bodyBase64: btoa(binary),
+                    };
+                }
+                """,
+                url,
+            )
+        if not isinstance(result, dict) or not result.get("ok"):
+            raise RuntimeError(f"browser fetch failed: {result}")
+        body_base64 = result.get("bodyBase64")
+        if not isinstance(body_base64, str):
+            raise RuntimeError("browser fetch did not return a base64 body")
+        content_type = value_to_str(result.get("contentType"))
+        data = base64.b64decode(body_base64)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        target = path_with_content_type(path, content_type)
+        if target.exists() and target.stat().st_size > 0 and not self.overwrite:
+            return target, content_type
+        target.write_bytes(data)
+        return target, content_type
 
 
 def best_urls_from_paths(value: dict[str, Any], paths: list[tuple[str, ...]]) -> list[str]:
@@ -582,7 +644,7 @@ def extension_from_url(path: str) -> str:
 
 
 def path_with_content_type(path: Path, content_type: str | None) -> Path:
-    if path.suffix != ".bin":
+    if path.suffix not in {"", ".bin", ".image"}:
         return path
     if not content_type:
         return path
