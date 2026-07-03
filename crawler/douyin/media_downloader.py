@@ -44,6 +44,8 @@ class MediaCandidate:
 
     @property
     def id(self) -> str:
+        if self.asset_type == "video" and self.aweme_id:
+            return f"video:{self.aweme_id}"
         digest = hashlib.sha1(
             "|".join(
                 [
@@ -225,6 +227,23 @@ class DouyinMediaDownloader:
         if existing is not None and existing.get("download_status") == "FAILED" and not self.retry_failed:
             return "SKIPPED"
 
+        if candidate.asset_type == "video" and not self.overwrite:
+            existing_video = self.existing_video_file(candidate)
+            if existing_video is not None:
+                self.store.save_media_asset(
+                    candidate.id,
+                    asset_type=candidate.asset_type,
+                    source_url=candidate.source_url,
+                    aweme_id=candidate.aweme_id,
+                    local_path=str(existing_video),
+                    download_status="DONE",
+                    file_size=existing_video.stat().st_size,
+                    content_type="video/mp4",
+                    task_id=candidate.task_id,
+                )
+                logger.info("Skipping existing Douyin video {} -> {}", candidate.aweme_id, existing_video)
+                return "SKIPPED"
+
         if self.dry_run:
             logger.info("Would download {} -> {}", candidate.source_url, local_path)
             return "SKIPPED"
@@ -364,7 +383,10 @@ class DouyinMediaDownloader:
         parsed = urlparse(candidate.source_url)
         ext = extension_from_url(parsed.path)
         digest = hashlib.sha1(candidate.source_url.encode("utf-8")).hexdigest()[:12]
-        if candidate.asset_type in {"video", "cover"}:
+        if candidate.asset_type == "video":
+            folder = self.output_dir / "videos" / safe_part(candidate.aweme_id or "unknown")
+            return folder / "video.mp4"
+        if candidate.asset_type == "cover":
             folder = self.output_dir / "videos" / safe_part(candidate.aweme_id or "unknown")
             stem = candidate.asset_type
         elif candidate.asset_type.startswith("comment-"):
@@ -384,6 +406,24 @@ class DouyinMediaDownloader:
             )
             stem = candidate.asset_type
         return folder / f"{stem}-{digest}{ext}"
+
+    def existing_video_file(self, candidate: MediaCandidate) -> Path | None:
+        if not candidate.aweme_id:
+            return None
+        folder = self.output_dir / "videos" / safe_part(candidate.aweme_id)
+        if not folder.exists():
+            return None
+        preferred = folder / "video.mp4"
+        if preferred.exists() and preferred.stat().st_size > 0:
+            return preferred
+        files = [
+            path
+            for path in folder.glob("*.mp4")
+            if path.is_file() and path.stat().st_size > 0
+        ]
+        if not files:
+            return None
+        return max(files, key=lambda path: path.stat().st_size)
 
     def download(self, url: str, path: Path) -> tuple[Path, str | None]:
         path.parent.mkdir(parents=True, exist_ok=True)
