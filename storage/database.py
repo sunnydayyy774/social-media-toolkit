@@ -303,8 +303,45 @@ class DuckDBDatabase:
         self._conn.execute(f"CREATE INDEX IF NOT EXISTS {table}_updated_idx ON {table}(updated_at)")
 
     def _replace_existing(self, collection: str, record_id: str, record: Record) -> None:
-        self._delete_existing(collection, record_id)
-        self._insert_record(collection, record_id, record)
+        payload = self._dump_record(record)
+        table = self._table_for_collection(collection)
+        if table is None:
+            self._conn.execute(
+                """
+                UPDATE records
+                   SET data = ?,
+                       updated_at = current_timestamp
+                 WHERE collection = ? AND id = ?
+                """,
+                [payload, collection, record_id],
+            )
+            return
+
+        indexed = self._indexed_values(collection, record)
+        self._conn.execute(
+            f"""
+            UPDATE {table}
+               SET data = ?,
+                   updated_at = current_timestamp,
+                   task_id = ?,
+                   author_id = ?,
+                   post_id = ?,
+                   keyword = ?,
+                   status = ?,
+                   url = ?
+             WHERE id = ?
+            """,
+            [
+                payload,
+                indexed["task_id"],
+                indexed["author_id"],
+                indexed["post_id"],
+                indexed["keyword"],
+                indexed["status"],
+                indexed["url"],
+                record_id,
+            ],
+        )
 
     def _insert_record(
         self,
