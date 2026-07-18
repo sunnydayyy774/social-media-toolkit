@@ -111,6 +111,23 @@ class DuckDBDatabase:
                 ).fetchall()
             return [self._load_record(row[0]) for row in rows]
 
+    def count_by_index(self, collection: str, column: str, value: str) -> int:
+        self._validate_collection(collection)
+        if column not in {"task_id", "author_id", "post_id", "keyword", "status", "url"}:
+            raise ValueError(f"Unsupported indexed column {column!r}.")
+
+        table = self._table_for_collection(collection)
+        if table is None:
+            raise ValueError(f"Collection {collection!r} does not have indexed columns.")
+
+        with self._lock:
+            return int(
+                self._conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {column} = ?",
+                    [value],
+                ).fetchone()[0]
+            )
+
     def update(
         self,
         collection: str,

@@ -14,6 +14,14 @@ DOUYIN_BASE_URL = "https://www.douyin.com"
 PromptFn = Callable[[str], None | Awaitable[None]]
 
 
+class DouyinFetchError(RuntimeError):
+    def __init__(self, url: str, result: dict[str, Any] | None) -> None:
+        self.url = url
+        self.result = result or {}
+        self.status = value_to_int(self.result.get("status"))
+        super().__init__(f"Douyin browser fetch failed for {url}: {result}")
+
+
 def user_profile_url(sec_user_id: str) -> str:
     return f"{DOUYIN_BASE_URL}/user/{sec_user_id}"
 
@@ -109,7 +117,7 @@ async def browser_fetch_json(page: Any, url: str) -> dict[str, Any] | list[Any] 
     )
 
     if not isinstance(result, dict) or not result.get("fetch_ok"):
-        raise RuntimeError(f"Douyin browser fetch failed for {url}: {result}")
+        raise DouyinFetchError(url, result if isinstance(result, dict) else None)
 
     json_value = result.get("json")
     if isinstance(json_value, dict | list):

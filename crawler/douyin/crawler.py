@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+import random
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -14,7 +16,9 @@ from storage import DuckDBDatabase
 from .storage import DouyinStore
 from .utils import (
     DOUYIN_BASE_URL,
+    DouyinFetchError,
     browser_fetch_json,
+    detect_login_popup,
     get_page_debug_info,
     navigate,
     smart_sleep,
@@ -28,6 +32,9 @@ from .utils import (
 
 DOUYIN_SEARCH_API_PATH = "/aweme/v1/web/general/search/single/"
 DOUYIN_DANMAKU_API_PATH = "/aweme/v1/web/danmaku/get_v2/"
+COMMENT_EMPTY_BACKOFF_SECONDS = [5.0, 10.0, 20.0, 40.0, 60.0]
+COMMENT_NETWORK_BACKOFF_SECONDS = [10.0, 30.0, 60.0]
+COMMENT_BACKOFF_JITTER_RATIO = 0.2
 
 
 @dataclass(slots=True)
@@ -57,6 +64,15 @@ class DouyinCrawler(BrowserCrawler[DouyinCrawlerConfig, DouyinStore]):
 
     db_cls = DuckDBDatabase
     store_cls = DouyinStore
+
+    def _comment_empty_retry_wait(self, retry_number: int) -> float:
+        return jittered_backoff(COMMENT_EMPTY_BACKOFF_SECONDS, retry_number)
+
+    def _comment_network_retry_wait(self, retry_number: int) -> float:
+        return jittered_backoff(COMMENT_NETWORK_BACKOFF_SECONDS, retry_number)
+
+    async def _sleep_comment_retry(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
 
     async def by_keyword(
         self,
@@ -475,6 +491,7 @@ class DouyinCrawler(BrowserCrawler[DouyinCrawlerConfig, DouyinStore]):
         cursor = self.store.get_video_comment_cursor(aweme_id)
         expected_comments = self.store.get_video_expected_comment_count(aweme_id) or 0
         empty_pages = 0
+        network_failures = 0
         page_number = 0
 
         while True:
@@ -483,22 +500,98 @@ class DouyinCrawler(BrowserCrawler[DouyinCrawlerConfig, DouyinStore]):
                 logger.info("Reached max_comment_pages={} for {}", self.config.max_comment_pages, aweme_id)
                 return
 
-            response = await self._fetch_comment_page(page, aweme_id, cursor)
+            try:
+                response = await self._fetch_comment_page(page, aweme_id, cursor)
+            except DouyinFetchError as exc:
+                if exc.status in {403, 429}:
+                    self.store.mark_video_comments_partial(aweme_id)
+                    logger.warning(
+                        "Marked Douyin video {} comments partial after fetch status {} at cursor={}",
+                        aweme_id,
+                        exc.status,
+                        cursor,
+                    )
+                    return
+                if await self._is_login_or_captcha_page(page):
+                    self.store.mark_video_comments_partial(aweme_id)
+                    logger.warning(
+                        "Marked Douyin video {} comments partial because login/captcha was detected at cursor={}",
+                        aweme_id,
+                        cursor,
+                    )
+                    return
+                network_failures += 1
+                if network_failures > len(COMMENT_NETWORK_BACKOFF_SECONDS):
+                    self.store.mark_video_comments_partial(aweme_id)
+                    logger.warning(
+                        "Marked Douyin video {} comments partial after network retries at cursor={}",
+                        aweme_id,
+                        cursor,
+                    )
+                    return
+                wait_seconds = self._comment_network_retry_wait(network_failures)
+                logger.info(
+                    "Douyin comments network retry for {} at cursor={} (retry {}/{}, status={}, wait={:.1f}s)",
+                    aweme_id,
+                    cursor,
+                    network_failures,
+                    len(COMMENT_NETWORK_BACKOFF_SECONDS),
+                    exc.status,
+                    wait_seconds,
+                )
+                await self._sleep_comment_retry(wait_seconds)
+                continue
+
+            network_failures = 0
             comments = response.get("comments") if isinstance(response, dict) else None
+            has_more = value_to_bool(response.get("has_more"))
+            next_cursor = value_to_int(response.get("cursor"))
+            if next_cursor is None:
+                next_cursor = value_to_int(response.get("next_cursor"))
             if not isinstance(comments, list) or not comments:
                 empty_pages += 1
                 saved_comments = self.store.count_saved_comments(aweme_id)
                 logger.info(
-                    "No Douyin comments for {} at cursor={} (empty {}/{}, saved={}, expected={})",
+                    "No Douyin comments for {} at cursor={} (empty_attempt={}, max_retries={}, saved={}, expected={}, has_more={}, next_cursor={})",
                     aweme_id,
                     cursor,
                     empty_pages,
                     self.config.max_empty_pages,
                     saved_comments,
                     expected_comments,
+                    has_more,
+                    next_cursor,
                 )
-                if expected_comments and saved_comments < expected_comments and empty_pages < self.config.max_empty_pages:
-                    await smart_sleep()
+                if has_more is False:
+                    break
+                if has_more is True and next_cursor is None:
+                    self.store.mark_video_comments_partial(aweme_id)
+                    logger.warning("Marked Douyin video {} comments partial because next cursor is missing", aweme_id)
+                    return
+                if has_more is True and next_cursor == cursor:
+                    self.store.mark_video_comments_partial(aweme_id)
+                    logger.warning("Marked Douyin video {} comments partial because cursor did not advance", aweme_id)
+                    return
+                if await self._is_login_or_captcha_page(page):
+                    self.store.mark_video_comments_partial(aweme_id)
+                    logger.warning(
+                        "Marked Douyin video {} comments partial because login/captcha was detected at cursor={}",
+                        aweme_id,
+                        cursor,
+                    )
+                    return
+                if expected_comments and saved_comments < expected_comments and empty_pages <= self.config.max_empty_pages:
+                    wait_seconds = self._comment_empty_retry_wait(empty_pages)
+                    logger.info(
+                        "Retrying empty Douyin comments for {} at cursor={} (retry {}/{}, has_more={}, wait={:.1f}s)",
+                        aweme_id,
+                        cursor,
+                        empty_pages,
+                        self.config.max_empty_pages,
+                        has_more,
+                        wait_seconds,
+                    )
+                    await self._sleep_comment_retry(wait_seconds)
                     continue
                 if expected_comments and saved_comments < expected_comments:
                     self.store.mark_video_comments_partial(aweme_id)
@@ -539,10 +632,6 @@ class DouyinCrawler(BrowserCrawler[DouyinCrawlerConfig, DouyinStore]):
                         task_id=task_id,
                     )
 
-            has_more = value_to_bool(response.get("has_more"))
-            next_cursor = value_to_int(response.get("cursor"))
-            if next_cursor is None:
-                next_cursor = value_to_int(response.get("next_cursor"))
             logger.info(
                 "Douyin comments {} page {} saved_total={} has_more={} cursor={}",
                 aweme_id,
@@ -578,6 +667,23 @@ class DouyinCrawler(BrowserCrawler[DouyinCrawlerConfig, DouyinStore]):
             return
         self.store.mark_video_comments_done(aweme_id)
         logger.info("Marked Douyin video {} comments done (new_saved={}, total_saved={})", aweme_id, total_saved, saved_comments)
+
+    async def _is_login_or_captcha_page(self, page: Any) -> bool:
+        if await detect_login_popup(page):
+            return True
+        try:
+            return bool(
+                await page.evaluate(
+                    """
+                    () => {
+                        const text = document.body ? document.body.innerText : '';
+                        return /验证码|验证|captcha|登录|login/i.test(text);
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return False
 
     async def _fetch_comment_page(
         self,
@@ -973,6 +1079,13 @@ class DouyinCrawler(BrowserCrawler[DouyinCrawlerConfig, DouyinStore]):
 
 def keyword_search_url(keyword: str) -> str:
     return f"{DOUYIN_BASE_URL}/search/{quote(keyword)}?type=video"
+
+
+def jittered_backoff(values: list[float], retry_number: int) -> float:
+    index = max(0, min(retry_number - 1, len(values) - 1))
+    base_seconds = values[index]
+    jitter = base_seconds * COMMENT_BACKOFF_JITTER_RATIO
+    return random.uniform(base_seconds - jitter, base_seconds + jitter)
 
 
 def extract_search_awemes(response: dict[str, Any]) -> list[dict[str, Any]]:

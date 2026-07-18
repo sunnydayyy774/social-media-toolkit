@@ -283,7 +283,7 @@ class DouyinStore:
         return bool(record and record.get("status") == DouyinVideoStatus.COMMENTS_DONE.value)
 
     def count_saved_comments(self, aweme_id: str) -> int:
-        return sum(1 for item in self.db.list(COMMENT_RAW_COLLECTION) if item.get("aweme_id") == aweme_id)
+        return self.db.count_by_index(COMMENT_RAW_COLLECTION, "post_id", aweme_id)
 
     def get_unfinished_video_ids(self, sec_user_id: str) -> list[str]:
         unfinished_statuses = {
